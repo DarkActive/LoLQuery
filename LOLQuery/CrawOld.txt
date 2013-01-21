@@ -1,0 +1,346 @@
+﻿private void crawl2()
+        {
+            int queries = 0;
+            bool summUpdates = true;
+
+            SummonerCr curSummoner;
+            AllPublicSummonerDataDTO summonerPages;
+            MasteryBook summonerMasteries;
+            AggregatedStats summonerAggStats;
+            PlayerLifeTimeStats summonerStats;
+            PublicSummoner summoner, fellowSummoner;
+            RecentGames recentGames, fellowRecentGames;
+            PlatformGameLifecycleDTO spectatorGame;
+            GameDTO currentGame;
+            Presence sumPres;
+            GameResult pResult;
+
+
+            Console.WriteLine("\nCrawling of PvPNet has commenced.\n");
+            while (pvpnet.Connected)
+            {
+                /** As long as the queue is not empty continue */
+                if (summonersQueue.Count > 0)
+                {
+                    curSummoner = summonersQueue.Dequeue();
+
+                    /** Only update a summoner, based on individual summoner frequency. */
+                    if ((getUnixTimestamp() - curSummoner.lastUpdate) < SummUpdateFreq)
+                    {
+                        summonersQueue.Enqueue(curSummoner);
+                        continue;
+                    }
+
+                    /** Get current summoner's information */
+                    summoner = pvpnet.RPC.summoner.GetSummonerByName(curSummoner.summonerName);
+
+                    if (summoner == null)
+                    {
+                        consoleError("Summoner Error: ");
+                        Console.WriteLine("Summoner '" + curSummoner.summonerName + "' is non-existant, removing from DB...");
+                        // TODO: Add function to remove non existant summoner from database
+                        continue;
+                    }
+
+                    /** Check to make sure Summoner ID is set, if not update it in the DB and queue */
+                    if (curSummoner.summonerId == 0)
+                    {
+                        curSummoner.summonerId = summoner.summonerId;
+                        db.addSummonerId(curSummoner.summonerName, summoner.summonerId, summoner.acctId);
+                    }
+
+                    recentGames = pvpnet.RPC.GetRecentGames(summoner.acctId);
+
+                    /** Sort recent games by newest game first */
+                    recentGames.gameStatistics.Sort(CompareGames);
+
+                    /** Console output with color for summoner to crawl */
+                    crawlSummOut(summoner.name);
+
+                    /** For each of the recent games process results and save to DB */
+                    for (int rNdx = 0; rNdx < recentGames.gameStatistics.Count(); rNdx++)
+                    {
+                        // Set update summoner to true by default, set to false if no updates
+                        summUpdates = true;
+
+                        if (!db.gameSummonerStatsExists(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId))
+                        {
+                            Console.WriteLine("\tAdding new game Id: " + recentGames.gameStatistics[rNdx].gameId);
+
+                            db.addOldGame(recentGames.gameStatistics[rNdx], summoner.summonerId);
+                            pResult = new GameResult(recentGames.gameStatistics[rNdx]);
+                            db.addGameStats(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId, recentGames.gameStatistics[rNdx], pResult);
+                        }
+                        else if (db.gameStatsIncomplete(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId))
+                        {
+                            Console.WriteLine("\tUpdating end of game stats Id: " + recentGames.gameStatistics[rNdx].gameId);
+
+                            PlayerLifeTimeStats pLifeTimeStats = pvpnet.RPC.RetrievePlayerStatsByAccountID(summoner.acctId, "CURRENT");
+                            db.updatePreGame(recentGames.gameStatistics[rNdx], summoner.summonerId, pLifeTimeStats.playerStatSummaries);
+                            pResult = new GameResult(recentGames.gameStatistics[rNdx]);
+
+                            Console.WriteLine("\t\tAdding game stats of player: " + summoner.name);
+                            db.addGameStats(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId, recentGames.gameStatistics[rNdx], pResult);
+
+                            List<long> fellowPlayersIds = db.getFellowPlayersIds(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId);
+                            List<string> fellowPlayersNames = pvpnet.RPC.GetSummonerNames(fellowPlayersIds);
+
+                            for (int fNdx = 0; fNdx < fellowPlayersNames.Count(); fNdx++)
+                            {
+                                fellowSummoner = pvpnet.RPC.GetSummonerByName(fellowPlayersNames[fNdx]);
+
+                                if (fellowSummoner == null)
+                                {
+                                    consoleError("Summoner Error: ");
+                                    Console.WriteLine("Adding Summoner stats for '" + curSummoner.summonerName + "', not found on servers...");
+                                    continue;
+                                }
+
+                                fellowRecentGames = pvpnet.RPC.GetRecentGames(fellowSummoner.acctId);
+                                /** Sort recent games by newest game first */
+                                fellowRecentGames.gameStatistics.Sort(CompareGames);
+
+                                for (int gNdx = 0; gNdx < fellowRecentGames.gameStatistics.Count(); gNdx++)
+                                {
+                                    if (fellowRecentGames.gameStatistics[gNdx].gameId == recentGames.gameStatistics[rNdx].gameId)
+                                    {
+                                        pResult = new GameResult(fellowRecentGames.gameStatistics[gNdx]);
+                                        Console.WriteLine("\t\tAdding game stats of player: " + fellowSummoner.name);
+                                        db.addGameStats(recentGames.gameStatistics[rNdx].gameId, fellowSummoner.summonerId, fellowRecentGames.gameStatistics[gNdx], pResult);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            summUpdates = false;
+                            break;
+                        }
+                    }
+
+                    /** Update all the summoner data if there is a change based on recent games */
+                    if (summUpdates)
+                    {
+                        Console.WriteLine("\tUpdating all summoner data...");
+                        summonerStats = pvpnet.RPC.RetrievePlayerStatsByAccountID(summoner.acctId, "CURRENT");
+                        summonerPages = pvpnet.RPC.summoner.GetAllPublicSummonerDataByAccount(summoner.acctId);
+                        summonerAggStats = pvpnet.RPC.GetAggregatedStats(summoner.acctId, "CLASSIC", "CURRENT");
+                        summonerMasteries = pvpnet.RPC.mastery.GetMasteryBook(summoner.summonerId);
+
+                        updateSummoner(summoner, summonerStats, summonerAggStats, summonerPages, summonerMasteries);
+                    }
+
+                    /** Look for an in progress game */
+                    if ((spectatorGame = pvpnet.RPC.game.retrieveInProgressSpectatorGameInfo(summoner.name)) != null)
+                    {
+                        currentGame = spectatorGame.game;
+
+                        if (!db.gameSummonerStatsExists(currentGame.id, summoner.summonerId))
+                        {
+                            Console.WriteLine("\tAdding In Progress Game Id: " + spectatorGame.game.id);
+                            db.addInProgressGame(currentGame, summoner.summonerId);
+                        }
+                    }
+
+                    /** Enqueue summoners for later */
+                    curSummoner.lastUpdate = getUnixTimestamp();
+                    summonersQueue.Enqueue(curSummoner);
+
+                    queries++;
+                    totalQueries++;
+                }
+
+                /** If exceeded max queries, take a break */
+                if (queries >= maxQueries)
+                {
+                    queries = 0;
+                    Console.WriteLine("\nWaiting for " + CrawlDelay + " minutes");
+
+                    int cnt = 0;
+                    while (cnt < CrawlDelay)
+                    {
+                        Thread.Sleep(60 * 1000);
+                        Console.WriteLine(".....");
+                        cnt++;
+                    }
+                }
+
+                /** Update queues based on frequency set */
+                if ((getUnixTimestamp() - lastUpdateQueue) >= updateQueuesFreq)
+                    updateQueues();
+            }
+        }
+
+        private void crawlold()
+        {
+            int queries = 0;
+            bool summUpdates = true;
+
+            SummonerCr curSummoner;
+            AllPublicSummonerDataDTO summonerPages;
+            MasteryBook summonerMasteries;
+            AggregatedStats summonerAggStats;
+            PlayerLifeTimeStats summonerStats;
+            PublicSummoner summoner, fellowSummoner;
+            RecentGames recentGames, fellowRecentGames;
+            PlatformGameLifecycleDTO spectatorGame;
+            GameDTO currentGame;
+            Presence sumPres;
+            GameResult pResult;
+
+            Console.WriteLine("\nCrawling of PvpNet has commenced.\n");
+            while (pvpnet.Connected)
+            {
+                /** As long as the queue is not empty continue */
+                if (summonersQueue.Count > 0)
+                {
+                    curSummoner = summonersQueue.Dequeue();
+               
+                    /** Only update a summoner, based on individual summoner frequency. */
+                    if ((getUnixTimestamp() - curSummoner.lastUpdate) < SummUpdateFreq)
+                    {
+                        summonersQueue.Enqueue(curSummoner);
+                        continue;
+                    }
+
+                    /** Get current summoner's information */
+                    summoner = pvpnet.RPC.summoner.GetSummonerByName(curSummoner.summonerName);
+
+                    if (summoner == null)
+                    {
+                        consoleError("Summoner Error: ");
+                        Console.WriteLine("Summoner '" + curSummoner.summonerName + "' is non-existant, removing from DB...");
+                        // TODO: Add function to remove non existant summoner from database
+                        continue;
+                    }
+
+                    /** Check to make sure Summoner ID is set, if not update it in the DB and queue */
+                    if (curSummoner.summonerId == 0)
+                    {
+                        curSummoner.summonerId = summoner.summonerId;
+                        db.addSummonerId(curSummoner.summonerName, summoner.summonerId, summoner.acctId);
+                    }
+
+                    recentGames = pvpnet.RPC.GetRecentGames(summoner.acctId);
+
+                    /** Sort recent games by newest game first */
+                    recentGames.gameStatistics.Sort(CompareGames);
+                    
+                    /** Console output with color for summoner to crawl */
+                    crawlSummOut(summoner.name);
+
+                    /** For each of the recent games process results and save to DB */
+                    for (int rNdx = 0; rNdx < recentGames.gameStatistics.Count(); rNdx++)
+                    {
+                        // Set update summoner to true by default, set to false if no updates
+                        summUpdates = true;
+
+                        if (!db.gameSummonerStatsExists(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId))
+                        {
+                            Console.WriteLine("\tAdding new game Id: " + recentGames.gameStatistics[rNdx].gameId);
+
+                            db.addOldGame(recentGames.gameStatistics[rNdx], summoner.summonerId);
+                            pResult = new GameResult(recentGames.gameStatistics[rNdx]);
+                            db.addGameStats(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId, recentGames.gameStatistics[rNdx], pResult);
+                        }
+                        else if (db.gameStatsIncomplete(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId))
+                        {
+                            Console.WriteLine("\tUpdating end of game stats Id: " + recentGames.gameStatistics[rNdx].gameId);
+
+                            PlayerLifeTimeStats pLifeTimeStats = pvpnet.RPC.RetrievePlayerStatsByAccountID(summoner.acctId, "CURRENT");
+                            db.updatePreGame(recentGames.gameStatistics[rNdx], summoner.summonerId, pLifeTimeStats.playerStatSummaries);
+                            pResult = new GameResult(recentGames.gameStatistics[rNdx]);
+
+                            Console.WriteLine("\t\tAdding game stats of player: " + summoner.name);
+                            db.addGameStats(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId, recentGames.gameStatistics[rNdx], pResult);
+
+                            List<long> fellowPlayersIds = db.getFellowPlayersIds(recentGames.gameStatistics[rNdx].gameId, summoner.summonerId);
+                            List<string> fellowPlayersNames = pvpnet.RPC.GetSummonerNames(fellowPlayersIds);
+
+                            for (int fNdx = 0; fNdx < fellowPlayersNames.Count(); fNdx++)
+                            {
+                                fellowSummoner = pvpnet.RPC.GetSummonerByName(fellowPlayersNames[fNdx]);
+
+                                if (fellowSummoner == null)
+                                {
+                                    consoleError("Summoner Error: ");
+                                    Console.WriteLine("Adding Summoner stats for '" + curSummoner.summonerName + "', not found on servers...");
+                                    continue;
+                                }
+
+                                fellowRecentGames = pvpnet.RPC.GetRecentGames(fellowSummoner.acctId);
+                                /** Sort recent games by newest game first */
+                                fellowRecentGames.gameStatistics.Sort(CompareGames);
+
+                                for (int gNdx = 0; gNdx < fellowRecentGames.gameStatistics.Count(); gNdx++)
+                                {
+                                    if (fellowRecentGames.gameStatistics[gNdx].gameId == recentGames.gameStatistics[rNdx].gameId)
+                                    {
+                                        pResult = new GameResult(fellowRecentGames.gameStatistics[gNdx]);
+                                        Console.WriteLine("\t\tAdding game stats of player: " + fellowSummoner.name);
+                                        db.addGameStats(recentGames.gameStatistics[rNdx].gameId, fellowSummoner.summonerId, fellowRecentGames.gameStatistics[gNdx], pResult);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            summUpdates = false;
+                            break;
+                        }
+                    }
+
+                    /** Update all the summoner data if there is a change based on recent games */
+                    if (summUpdates)
+                    {
+                        Console.WriteLine("\tUpdating all summoner data...");
+                        summonerStats = pvpnet.RPC.RetrievePlayerStatsByAccountID(summoner.acctId, "CURRENT");
+                        summonerPages = pvpnet.RPC.summoner.GetAllPublicSummonerDataByAccount(summoner.acctId);
+                        summonerAggStats = pvpnet.RPC.GetAggregatedStats(summoner.acctId, "CLASSIC", "CURRENT");
+                        summonerMasteries = pvpnet.RPC.mastery.GetMasteryBook(summoner.summonerId);
+
+                        updateSummoner(summoner, summonerStats, summonerAggStats, summonerPages, summonerMasteries);
+                    }
+
+                    /** Look for an in progress game */
+                    if ((spectatorGame = pvpnet.RPC.game.retrieveInProgressSpectatorGameInfo(summoner.name)) != null)
+                    {
+                        currentGame = spectatorGame.game;
+
+                        if (!db.gameSummonerStatsExists(currentGame.id, summoner.summonerId))
+                        {
+                            Console.WriteLine("\tAdding In Progress Game Id: " + spectatorGame.game.id);
+                            db.addInProgressGame(currentGame, summoner.summonerId);
+                        }
+                    }
+
+                    /** Enqueue summoners for later */
+                    curSummoner.lastUpdate = getUnixTimestamp();
+                    summonersQueue.Enqueue(curSummoner);
+
+                    queries++;
+                    totalQueries++;
+                }
+
+                /** If exceeded max queries, take a break */
+                if (queries >= maxQueries)
+                {
+                    queries = 0;
+                    Console.WriteLine("\nWaiting for " + CrawlDelay + " minutes");
+
+                    int cnt = 0;
+                    while (cnt < CrawlDelay)
+                    {
+                        Thread.Sleep(60 * 1000);
+                        Console.WriteLine(".....");
+                        cnt++;
+                    }
+                }
+
+                /** Update queues based on frequency set */
+                if ((getUnixTimestamp() - lastUpdateQueue) >= updateQueuesFreq)
+                    updateQueues();
+            }
+        }
